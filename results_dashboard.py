@@ -33,8 +33,9 @@ st.title("Interpretable pit-stop policy: results")
 st.caption(
     f"Trained on {setup['train_years']} ({setup['races_train']} races), evaluated off-policy "
     f"on {setup['test_year']} ({setup['races_test']} held-out races). Outcome: seconds gained "
-    f"on the field median over the next K = {setup['K']} laps, minus the circuit pit loss if "
-    f"the driver still owes the two-compound stop. Gains are doubly-robust estimates "
+    f"over the next K = {setup['K']} laps on the median of the cars within ±3 positions, minus "
+    f"the circuit's typical in-window stop cost if the driver still owes the two-compound "
+    f"stop. Gains are doubly-robust estimates "
     f"relative to what teams actually did; bands are 95% bootstrap intervals over races.")
 
 tree_row = pol[pol["policy"] == f"DR tree (depth {R['depth']})"].iloc[0]

@@ -5,7 +5,7 @@ Usage:
     python build_dataset.py --years 2024 2025
 
 Writes data/laps.pkl (one row per driver and lap, columns from openf1.FEATURES
-plus Circuit, Year and LapStart). Races that fail to load are skipped and listed.
+plus LapStart, Circuit, Year and SessionKey). Races that fail to load are skipped and listed.
 """
 
 import argparse
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from openf1 import get, load_session, race_sessions
+from openf1 import load_session, race_sessions
 
 OUT = Path(__file__).parent / "data" / "laps.pkl"
 
@@ -34,23 +34,14 @@ def main():
                 failed.append((label, repr(e)[:120]))
                 print(f"  FAILED {label}: {e!r}"[:160], flush=True)
                 continue
-            # Lap start times are needed for the outcome; load_session drops them.
-            raw = get("laps", session_key=int(s["session_key"]))
-            names = get("drivers", session_key=int(s["session_key"]))
-            starts = (raw[["driver_number", "lap_number", "date_start"]]
-                      .merge(names[["driver_number", "name_acronym"]]
-                             .drop_duplicates("driver_number"), on="driver_number")
-                      .rename(columns={"name_acronym": "Driver", "lap_number": "LapNumber"}))
-            starts["LapStart"] = pd.to_datetime(starts["date_start"], format="ISO8601")
-            laps = laps.merge(starts[["Driver", "LapNumber", "LapStart"]]
-                              .drop_duplicates(["Driver", "LapNumber"]),
-                              on=["Driver", "LapNumber"], how="left")
             laps["Circuit"] = s["circuit_short_name"]
             laps["Year"] = year
             laps["SessionKey"] = int(s["session_key"])
             tables.append(laps)
             print(f"{label}: {len(laps)} rows, {laps['Pit'].sum()} pits", flush=True)
 
+    if not tables:  # every race failed: a code bug, not rate limiting; keep the old file
+        raise SystemExit(f"no race loaded, {OUT} left unchanged; first error: {failed[0][1]}")
     OUT.parent.mkdir(exist_ok=True)
     df = pd.concat(tables, ignore_index=True)
     df.to_pickle(OUT)

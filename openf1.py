@@ -54,7 +54,13 @@ def get(endpoint, **params):
         return pd.DataFrame(json.loads(path.read_text()))
 
     for attempt in range(5):
-        resp = requests.get(f"{API}/{endpoint}", params=params, timeout=60)
+        try:
+            resp = requests.get(f"{API}/{endpoint}", params=params, timeout=60)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 4:
+                raise
+            time.sleep(2 ** attempt)
+            continue
         if resp.status_code == 429:  # rate limited: back off and retry
             time.sleep(2 ** attempt)
             continue
@@ -64,7 +70,10 @@ def get(endpoint, **params):
     else:
         resp.raise_for_status()
         data = resp.json()
-    path.write_text(json.dumps(data))
+    # Write then rename, so an interrupted run never leaves a truncated cache file.
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
     time.sleep(0.4)  # stay under the free rate limit
     return pd.DataFrame(data)
 
@@ -92,25 +101,49 @@ def find_race(year, name):
 
 
 def track_status_by_lap(race_control, total_laps):
-    """Per-lap safety car / VSC flags from race-control messages."""
-    sc = np.zeros(total_laps + 1, dtype=int)
-    vsc = np.zeros(total_laps + 1, dtype=int)
-    if race_control.empty:
-        return sc, vsc
+    """Per-lap safety car / VSC flags (arrays indexed by lap) from race-control messages.
 
-    msgs = race_control[race_control["category"] == "SafetyCar"].sort_values("date")
-    sc_on = vsc_on = None
-    for _, m in msgs.iterrows():
-        text, lap = m["message"].upper(), int(m["lap_number"])
+    A period covers the laps from its deployment to its end, inclusive. Besides the
+    explicit "SAFETY CAR IN THIS LAP" / "VIRTUAL SAFETY CAR ENDING", a period also
+    ends at a red flag, a VSC ends when it is upgraded to a full safety car, and a
+    period still open at the flag runs to the last lap. (Without these rules about
+    one race in seven loses SC/VSC laps, e.g. 2023 Melbourne's two red-flagged SCs.)
+    """
+    flags = {"sc": np.zeros(total_laps + 1, dtype=int),
+             "vsc": np.zeros(total_laps + 1, dtype=int)}
+    if race_control.empty:
+        return flags["sc"], flags["vsc"]
+
+    start = {"sc": None, "vsc": None}
+
+    def open_(kind, lap):
+        if start[kind] is None:  # a repeated "DEPLOYED" keeps the earlier start
+            start[kind] = lap
+
+    def close(kind, lap):
+        if start[kind] is not None:
+            flags[kind][start[kind]:lap + 1] = 1
+            start[kind] = None
+
+    msgs = race_control[race_control["category"].isin(["SafetyCar", "Flag"])
+                        & race_control["lap_number"].notna()].sort_values("date")
+    for text, lap in zip(msgs["message"].str.upper(), msgs["lap_number"].astype(int)):
+        lap = min(lap, total_laps)
         if "VIRTUAL SAFETY CAR DEPLOYED" in text:
-            vsc_on = lap
-        elif "VIRTUAL SAFETY CAR ENDING" in text and vsc_on is not None:
-            vsc[vsc_on:lap + 1], vsc_on = 1, None
+            open_("vsc", lap)
+        elif "VIRTUAL SAFETY CAR ENDING" in text:
+            close("vsc", lap)
         elif "SAFETY CAR DEPLOYED" in text:
-            sc_on = lap
-        elif "SAFETY CAR IN THIS LAP" in text and sc_on is not None:
-            sc[sc_on:lap + 1], sc_on = 1, None
-    return sc, vsc
+            close("vsc", lap)  # VSC upgraded to a full safety car
+            open_("sc", lap)
+        elif "SAFETY CAR IN THIS LAP" in text:
+            close("sc", lap)
+        elif "RED FLAG" in text:
+            close("sc", lap)
+            close("vsc", lap)
+    close("sc", total_laps)
+    close("vsc", total_laps)
+    return flags["sc"], flags["vsc"]
 
 
 def _tyres_by_lap(stints):
@@ -139,7 +172,9 @@ def _asof(laps, table, value_col, out, by="driver_number"):
         laps[out] = np.nan
         return laps
     t = table.copy()
-    t["date"] = pd.to_datetime(t["date"], format="ISO8601")
+    # Match LapEnd's resolution: pandas >= 3 may parse the two at different units
+    # (ns vs us), and merge_asof refuses mismatched keys.
+    t["date"] = pd.to_datetime(t["date"], format="ISO8601").astype(laps["LapEnd"].dtype)
     t[out] = pd.to_numeric(t[value_col], errors="coerce")  # "+1 LAP" -> NaN
     cols = ["date", out] + ([by] if by else [])
     return pd.merge_asof(laps.sort_values("LapEnd"), t[cols].sort_values("date"),
@@ -174,8 +209,11 @@ def load_session(session):
     laps = _asof(laps, weather, "track_temperature", "TrackTemp", by=None)
     laps = _asof(laps, weather, "rainfall", "Rainfall", by=None)
 
-    # Gap behind = gap ahead of the car one position back, on the same lap.
-    behind = laps[["LapNumber", "Position", "GapAhead"]].copy()
+    # Gap behind = gap ahead of the car one position back, on the same lap. Position
+    # feeds can briefly give two cars the same position; keep one so the merge
+    # cannot duplicate laps.
+    behind = (laps[["LapNumber", "Position", "GapAhead"]].dropna(subset=["Position"])
+              .drop_duplicates(["LapNumber", "Position"]))
     behind["Position"] -= 1
     laps = laps.merge(behind.rename(columns={"GapAhead": "GapBehind"}),
                       on=["LapNumber", "Position"], how="left")
@@ -194,7 +232,9 @@ def load_session(session):
     laps["PitOutLap"] = laps["PitOutLap"].astype("boolean").fillna(False).astype(int)
     laps["Pit"] = laps["Pit"].fillna(0).astype(int)
 
-    return laps[list(FEATURES)].sort_values(["Driver", "LapNumber"]).reset_index(drop=True)
+    # LapStart is not a feature but the outcome (elapsed time over K laps) needs it.
+    return (laps[list(FEATURES) + ["LapStart"]]
+            .sort_values(["Driver", "LapNumber"]).reset_index(drop=True))
 
 
 def load_race(year, name):

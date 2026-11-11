@@ -170,7 +170,7 @@ c[4].metric("SC / VSC laps", int(neutral_laps))
 st.subheader("Features")
 st.caption("Role follows the proposal: context x (what the strategist sees), "
            "action T (pit or not), outcome y (built from lap times later).")
-st.dataframe(feature_table(laps), hide_index=True, use_container_width=True,
+st.dataframe(feature_table(laps), hide_index=True, width="stretch",
              height=35 * (len(FEATURES) + 1) + 3)
 
 # ---- One feature at a time ----------------------------------------------------
@@ -180,10 +180,10 @@ col = st.selectbox("Feature", explorable, index=explorable.index("TyreLife"))
 left, right = st.columns(2)
 left.markdown(f"**Distribution of {col}**")
 left.altair_chart(distribution_chart(laps, col).properties(height=300),
-                  use_container_width=True)
+                  width="stretch")
 right.markdown(f"**Pit rate by {col}**")
 right.altair_chart(pit_rate_chart(laps, col).properties(height=300),
-                   use_container_width=True)
+                   width="stretch")
 right.caption("Values with fewer than 20 laps are hidden.")
 
 # ---- One race -------------------------------------------------------------------
@@ -191,7 +191,7 @@ st.subheader("One race")
 event = st.selectbox("Race", sorted(laps["Event"].unique()))
 race = laps[laps["Event"] == event]
 st.markdown("**Tyre strategies** (grey bands: safety car / VSC)")
-st.altair_chart(strategy_chart(race), use_container_width=True)
+st.altair_chart(strategy_chart(race), width="stretch")
 
 order = race.sort_values("LapNumber").groupby("Driver")["Position"].last().sort_values()
 drivers = st.multiselect("Drivers (up to 4)", list(order.index),
@@ -199,10 +199,10 @@ drivers = st.multiselect("Drivers (up to 4)", list(order.index),
                          key=f"drivers_{event}")
 if drivers:
     st.markdown("**Lap times** (pit in/out laps and laps over 107% of the median removed)")
-    st.altair_chart(lap_time_chart(race, drivers), use_container_width=True)
+    st.altair_chart(lap_time_chart(race, drivers), width="stretch")
 
 # ---- Raw rows -------------------------------------------------------------------
 st.subheader("Rows")
-st.dataframe(race.head(200), hide_index=True, use_container_width=True)
+st.dataframe(race.head(200), hide_index=True, width="stretch")
 st.download_button("Download the whole sample as CSV", laps.to_csv(index=False),
                    file_name=f"openf1_sample_{year}.csv", mime="text/csv")

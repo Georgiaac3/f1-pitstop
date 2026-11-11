@@ -22,11 +22,13 @@ DATA = Path(__file__).parent / "data" / "laps.pkl"
 OUT = Path(__file__).parent / "results"
 TRAIN_YEARS, TEST_YEAR = [2023, 2024], 2025
 STREET = {"Monte Carlo", "Baku", "Singapore", "Jeddah", "Las Vegas", "Miami", "Melbourne"}
+TRIM = 0.01  # common support: drop rows with estimated Pr(pit) < TRIM or > 1 - TRIM
+CLIP = 0.01  # propensities are clipped to [CLIP, 1 - CLIP] inside the DR weights
 
 
-def prepare(laps, K=10, stop_debt=True, trim=0.01, clip=0.01, drop_sc=False,
+def prepare(laps, K=10, stop_debt=True, trim=TRIM, clip=CLIP, drop_sc=False,
             debt_pitlane=False, reference="local"):
-    """Rows, cross-fitted nuisances and rewards for train and test."""
+    """Rows, cross-fitted nuisances and rewards for train and test, trimmed to common support."""
     train_laps = laps[laps["Year"].isin(TRAIN_YEARS)]
     # Circuit constants are nuisances too: estimate them on training races only.
     pit_loss = estimate_pit_loss(train_laps)
@@ -42,19 +44,24 @@ def prepare(laps, K=10, stop_debt=True, trim=0.01, clip=0.01, drop_sc=False,
     train = rows[rows["Year"].isin(TRAIN_YEARS)].reset_index(drop=True)
     test = rows[rows["Year"] == TEST_YEAR].reset_index(drop=True)
     train, test = nuisance_predictions(train, test)
-    info = {"rows_train": len(train), "rows_test": len(test)}
-    # Common support: drop rows whose pit propensity is essentially 0 or 1.
-    keep_tr = train["p1"].between(trim, 1 - trim)
-    keep_te = test["p1"].between(trim, 1 - trim)
-    info.update(dropped_train=int((~keep_tr).sum()), dropped_test=int((~keep_te).sum()),
-                dropped_pits_train=int(train.loc[~keep_tr, "T"].sum()),
-                dropped_pits_test=int(test.loc[~keep_te, "T"].sum()))
-    train, test = train[keep_tr].reset_index(drop=True), test[keep_te].reset_index(drop=True)
-    for df in (train, test):
+    for df in (train, test):  # rewards are per row, so trimming afterwards is fine
         dm, dr = rewards(df, clip=clip)
         df[["dm0", "dm1"]], df[["dr0", "dr1"]] = dm, dr
-    info["stop_cost_overall"] = stop_cost[1]
+    info = {"rows_train": len(train), "rows_test": len(test),
+            "stop_cost_overall": stop_cost[1]}
+    train, test, dropped = trim_support(train, test, trim)
+    info.update(dropped)
     return train, test, info, pit_loss
+
+
+def trim_support(train, test, trim):
+    """Common support: drop rows whose pit propensity is below trim or above 1 - trim."""
+    keep_tr = train["p1"].between(trim, 1 - trim)
+    keep_te = test["p1"].between(trim, 1 - trim)
+    dropped = {"dropped_train": int((~keep_tr).sum()), "dropped_test": int((~keep_te).sum()),
+               "dropped_pits_train": int(train.loc[~keep_tr, "T"].sum()),
+               "dropped_pits_test": int(test.loc[~keep_te, "T"].sum())}
+    return train[keep_tr].reset_index(drop=True), test[keep_te].reset_index(drop=True), dropped
 
 
 def gamma(df, kind="dr"):
@@ -174,11 +181,12 @@ def main():
     print(f"laps: {len(laps)} from {laps['Event'].nunique()} races")
 
     # ---- Main run -----------------------------------------------------------
+    # Fit once without trimming (the overlap plot needs every row), then trim.
     train_all, test_all, info, pit_loss = prepare(laps, K=args.K, trim=0.0)
     overlap = overlap_table(pd.concat([train_all.assign(Split="train"), test_all.assign(Split="test")]))
     overlap.to_csv(OUT / "overlap.csv", index=False)
-
-    train, test, info, _ = prepare(laps, K=args.K)
+    train, test, dropped = trim_support(train_all, test_all, TRIM)
+    info.update(dropped)
     print(json.dumps(info))
     cv = cv_depth(train)
     depth = max(cv, key=cv.get)
@@ -217,7 +225,7 @@ def main():
 
     results = {
         "setup": {"K": args.K, "train_years": TRAIN_YEARS, "test_year": TEST_YEAR,
-                  "trim": 0.01, "clip": 0.01, "stop_debt": True,
+                  "trim": TRIM, "clip": CLIP, "stop_debt": True,
                   "races_train": int(train["Event"].nunique()),
                   "races_test": int(test["Event"].nunique()),
                   "pit_loss_by_circuit": pit_loss[0], "pit_loss_overall": pit_loss[1], **info},

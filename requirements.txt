@@ -1,6 +1,8 @@
+# Tested with Python 3.12, pandas 3.1, numpy 2.5, scikit-learn 1.9, streamlit 1.67, altair 6.3.
 requests
-pandas
-numpy
-scikit-learn
-streamlit
-altair
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+streamlit>=1.50
+altair>=5
+pytest

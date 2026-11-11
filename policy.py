@@ -2,15 +2,18 @@
 
 Pipeline (Section 2 of the proposal):
   1. decision rows: one per (driver, lap) where a stop is a real option
-  2. outcome y: seconds gained on the field median over the next K laps
-     (optionally minus a "stop debt": the circuit pit loss if the driver still owes
-      the mandatory second dry compound when the window ends; see build_rows)
+  2. outcome y: seconds gained over the next K laps on the median of the cars within
+     +-3 positions, minus a "stop debt" (the circuit's typical in-window cost of a
+     green-flag stop) if the driver still owes the mandatory second dry compound
+     when the window ends; see build_rows
   3. nuisances, cross-fitted by race: outcome models f_t(x) and propensity p_t(x)
   4. rewards Gamma^DM and Gamma^DR (doubly robust)
   5. optimal policy tree of depth <= 3, exhaustive search over quantile splits
 Evaluation (Section 3): train on 2023-24, hold out 2025, DR off-policy value with
 nuisances fit on training races only, bootstrap CIs over races.
 """
+
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -100,10 +103,13 @@ def build_rows(laps, K=10, min_tyre_age=5, stop_debt=True, pit_loss=None, stop_c
     laps = laps.sort_values(["Event", "Driver", "LapNumber"]).copy()
     g = laps.groupby(["Event", "Driver"])
 
-    # Elapsed race time from the start of lap L to the start of lap L+K.
-    laps["Elapsed"] = (g["LapStart"].shift(-K) - laps["LapStart"]).dt.total_seconds()
+    # Elapsed race time from the start of lap L to the start of lap L+K. Rows are
+    # shifted, so require the row K ahead to really be lap L+K (laps with no timing
+    # are missing from the table, and a gap would silently stretch the window).
+    whole_window = g["LapNumber"].shift(-K) == laps["LapNumber"] + K
+    laps["Elapsed"] = ((g["LapStart"].shift(-K) - laps["LapStart"]).dt.total_seconds()
+                       .where(whole_window))
     if reference == "local":  # cars within +-3 positions: field bunching (SC) cancels
-        import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             laps["FieldElapsed"] = local_median(laps)
