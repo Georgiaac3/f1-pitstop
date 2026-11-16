@@ -1,4 +1,4 @@
-"""Interpretable pit-stop policies from observational OpenF1 data (15.095 proposal).
+"""Interpretable pit-stop policies from observational OpenF1 data.
 
 Pipeline (Section 2 of the proposal):
   1. decision rows: one per (driver, lap) where a stop is a real option
@@ -83,7 +83,7 @@ def local_median(df, value="Elapsed", window=3):
 
 
 def build_rows(laps, K=10, min_tyre_age=5, stop_debt=True, pit_loss=None, stop_cost=None,
-               reference="local"):
+               reference="local", min_laps_left=5):
     """One row per (driver, lap) decision point with context x, action T, outcome y.
 
     y = (reference elapsed time over laps L..L+K-1) - (driver's elapsed time), where the
@@ -99,16 +99,34 @@ def build_rows(laps, K=10, min_tyre_age=5, stop_debt=True, pit_loss=None, stop_c
     policy toward pitting; charging nothing makes every stop look ~8-20 s worse.
     `pit_loss` / `stop_cost` are ({circuit: s}, overall) and should come from
     training races; if None they are estimated from `laps`.
+
+    K="race": the window runs from lap L to the start of lap TotalLaps - 2 ("rest of
+    race"), so a deferred stop is paid inside it and no stop debt is needed. Decisions
+    are kept up to `min_laps_left` laps before that end, and decisions before a red
+    flag are dropped.
     """
+    race = K == "race"
+    if race:
+        stop_debt = False  # a deferred stop is paid inside the rest-of-race outcome
     laps = laps.sort_values(["Event", "Driver", "LapNumber"]).copy()
     g = laps.groupby(["Event", "Driver"])
 
-    # Elapsed race time from the start of lap L to the start of lap L+K. Rows are
-    # shifted, so require the row K ahead to really be lap L+K (laps with no timing
-    # are missing from the table, and a gap would silently stretch the window).
-    whole_window = g["LapNumber"].shift(-K) == laps["LapNumber"] + K
-    laps["Elapsed"] = ((g["LapStart"].shift(-K) - laps["LapStart"]).dt.total_seconds()
-                       .where(whole_window))
+    if race:
+        # Elapsed race time from the start of lap L to the start of lap TotalLaps - 2
+        # (a car lapped once or twice still starts that lap; retirements get NaN).
+        end_lap = laps["TotalLaps"] - 2
+        starts = laps.groupby(["Event", "Driver", "LapNumber"])["LapStart"].first()
+        end_start = starts.reindex(pd.MultiIndex.from_arrays(
+            [laps["Event"], laps["Driver"], end_lap])).to_numpy()
+        laps["Elapsed"] = (pd.Series(end_start, index=laps.index)
+                           - laps["LapStart"]).dt.total_seconds()
+    else:
+        # Elapsed race time from the start of lap L to the start of lap L+K. Rows are
+        # shifted, so require the row K ahead to really be lap L+K (laps with no timing
+        # are missing from the table, and a gap would silently stretch the window).
+        whole_window = g["LapNumber"].shift(-K) == laps["LapNumber"] + K
+        laps["Elapsed"] = ((g["LapStart"].shift(-K) - laps["LapStart"]).dt.total_seconds()
+                           .where(whole_window))
     if reference == "local":  # cars within +-3 positions: field bunching (SC) cancels
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
@@ -123,32 +141,54 @@ def build_rows(laps, K=10, min_tyre_age=5, stop_debt=True, pit_loss=None, stop_c
         laps[f"Used{c}"] = (dry == c).astype(int).groupby([laps["Event"], laps["Driver"]]).cummax()
     used = laps[[f"Used{c}" for c in DRY]].sum(axis=1)
     laps["TwoCompoundsDone"] = (used >= 2).astype(int)
-    laps["DoneByWindowEnd"] = g["TwoCompoundsDone"].shift(-(K - 1))
+    laps["DoneByWindowEnd"] = 1.0 if race else g["TwoCompoundsDone"].shift(-(K - 1))
 
     if pit_loss is None:
         pit_loss = estimate_pit_loss(laps)
     by_circuit, overall = pit_loss
     laps["PitLoss"] = laps["Circuit"].map(by_circuit).fillna(overall)
     if stop_cost is None:
-        stop_cost = estimate_stop_cost(laps)
+        stop_cost = ({}, 0.0) if not stop_debt else estimate_stop_cost(laps)
     laps["StopCost"] = laps["Circuit"].map(stop_cost[0]).fillna(stop_cost[1])
     laps["Debt"] = (1 - laps["DoneByWindowEnd"]) * laps["StopCost"] if stop_debt else 0.0
     laps["y"] = laps["Gain"] - laps["Debt"]
 
+    # Where each stint really ends (from the full lap table, before any filtering):
+    # the executable evaluation (stopping.py) needs the team's stop lap even when it
+    # falls outside the decision rows.
+    stint_g = laps.groupby(["Event", "Driver", "Stint"])
+    laps["StintEndLap"] = stint_g["LapNumber"].transform("max")
+    ends_in_stop = laps["Pit"].where(laps["LapNumber"] == laps["StintEndLap"])
+    laps["StintStopLap"] = laps["StintEndLap"].where(
+        ends_in_stop.groupby([laps["Event"], laps["Driver"], laps["Stint"]]).transform("max") == 1)
+
     # A lap is "wet" if anyone on track is on intermediates or wets.
     wet = laps.groupby(["Event", "LapNumber"])["Compound"].transform(
         lambda s: s.isin(["INTERMEDIATE", "WET"]).any())
+    window = 10**6 if race else K  # race: any wet lap until the flag
     wet_ahead = wet.groupby([laps["Event"], laps["Driver"]]).transform(
-        lambda s: s[::-1].rolling(K, min_periods=1).max()[::-1])
+        lambda s: s[::-1].rolling(window, min_periods=1).max()[::-1])
 
-    # Windows containing a red flag (race suspended) or a long repair are not
-    # strategy decisions: drop windows over twice the normal K-lap time (theirs or
-    # the reference's).
-    normal = K * laps.groupby("Event")["LapTime"].transform("median")
-    abnormal = (laps["Elapsed"] > 2 * normal) | (laps["FieldElapsed"] > 2 * normal)
+    if race:
+        # A red flag ahead (free tyre change, field reset) dominates the rest-of-race
+        # outcome: drop decisions before the last suspension. A suspended lap is one
+        # whose field-median duration (start to next start) is over 3x the race norm.
+        dur = (g["LapStart"].shift(-1) - laps["LapStart"]).dt.total_seconds()
+        lap_med = dur.groupby([laps["Event"], laps["LapNumber"]]).transform("median")
+        susp = lap_med > 3 * lap_med.groupby(laps["Event"]).transform("median")
+        last_susp = laps["LapNumber"].where(susp).groupby(laps["Event"]).transform("max")
+        abnormal = laps["LapNumber"] <= last_susp.fillna(-1)
+        in_race = laps["LapNumber"] <= laps["TotalLaps"] - 2 - min_laps_left
+    else:
+        # Windows containing a red flag (race suspended) or a long repair are not
+        # strategy decisions: drop windows over twice the normal K-lap time (theirs
+        # or the reference's).
+        normal = K * laps.groupby("Event")["LapTime"].transform("median")
+        abnormal = (laps["Elapsed"] > 2 * normal) | (laps["FieldElapsed"] > 2 * normal)
+        in_race = laps["LapNumber"] + K <= laps["TotalLaps"]
 
     keep = (~abnormal & laps["Compound"].isin(DRY) & (laps["LapNumber"] >= 2)
-            & (laps["LapNumber"] + K <= laps["TotalLaps"]) & (laps["PitOutLap"] == 0)
+            & in_race & (laps["PitOutLap"] == 0)
             & (laps["TyreLife"] >= min_tyre_age) & (wet_ahead == 0) & (laps["Rainfall"] == 0)
             & laps["y"].notna() & laps["DoneByWindowEnd"].notna())
     rows = laps[keep].copy()
@@ -202,8 +242,38 @@ def _propensity_model():
     return make_pipeline(pre, LogisticRegression(C=1.0, max_iter=3000))
 
 
-def fit_nuisances(train):
-    """Fit f_0, f_1 and the pit propensity on `train`; return a predict function."""
+# Gradient-boosted propensity (P0). Compared with the logistic model it is better
+# calibrated over whole stints, which the executable evaluation needs (it multiplies
+# 1/(1 - p) over every lap a car stays out): cross-fitted log-loss 0.142 vs 0.166 on
+# 2023-24, and mean stint weights near 1 instead of up to ~3000 for late-stopping
+# rules. It has no circuit or team effects: circuit one-hots overfit across seasons
+# (a circuit's strategy changes with the tyre allocation), and PitLoss / TrackTemp
+# already carry most of the circuit information.
+PROP_GBM_FEATURES = TREE_FEATURES + ["StintShare", "LapsToGoIfOwed"]
+
+
+def _gbm_design(df):
+    X = df[TREE_FEATURES].copy()
+    X["StintShare"] = df["TyreLife"] / (df["TyreLife"] + df["LapsRemaining"])
+    X["LapsToGoIfOwed"] = df["LapsRemaining"] * (1 - df["TwoCompoundsDone"])
+    return X
+
+
+class _GBMPropensity:
+    def fit(self, df, T):
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        self.m = HistGradientBoostingClassifier(
+            max_depth=3, learning_rate=0.05, max_iter=300, min_samples_leaf=100,
+            l2_regularization=1.0, random_state=0).fit(_gbm_design(df), T)
+        return self
+
+    def predict_proba(self, df):
+        return self.m.predict_proba(_gbm_design(df))
+
+
+def fit_nuisances(train, propensity="logit"):
+    """Fit f_0, f_1 and the pit propensity on `train`; return a predict function.
+    propensity: "logit" (v1: splines + team/circuit effects) or "gbm" (P0)."""
     X = _design(train)
     cats = {c: sorted(X[c].unique()) for c in CATEGORICAL}
     Xh = _encode_for_hgb(X, cats)
@@ -211,22 +281,25 @@ def fit_nuisances(train):
     for t in (0, 1):
         m = train["T"] == t
         f[t] = _outcome_model().fit(Xh[m], train.loc[m, "y"])
-    prop = _propensity_model().fit(X, train["T"])
+    if propensity == "gbm":
+        prop, prop_in = _GBMPropensity().fit(train, train["T"]), (lambda df: df)
+    else:
+        prop, prop_in = _propensity_model().fit(X, train["T"]), _design
 
     def predict(df):
         Xd = _design(df)
         Xdh = _encode_for_hgb(Xd, cats)
-        return f[0].predict(Xdh), f[1].predict(Xdh), prop.predict_proba(Xd)[:, 1]
+        return f[0].predict(Xdh), f[1].predict(Xdh), prop.predict_proba(prop_in(df))[:, 1]
     return predict
 
 
-def nuisance_predictions(train, test, n_folds=5):
+def nuisance_predictions(train, test, n_folds=5, propensity="logit"):
     """Cross-fitted (by race) predictions on train; train-only fit for test."""
     tr = np.zeros((len(train), 3))
     for fit_idx, pred_idx in GroupKFold(n_splits=n_folds).split(train, groups=train["Event"]):
-        predict = fit_nuisances(train.iloc[fit_idx])
+        predict = fit_nuisances(train.iloc[fit_idx], propensity)
         tr[pred_idx] = np.column_stack(predict(train.iloc[pred_idx]))
-    te = np.column_stack(fit_nuisances(train)(test))
+    te = np.column_stack(fit_nuisances(train, propensity)(test))
     cols = ["f0", "f1", "p1"]
     return (train.assign(**dict(zip(cols, tr.T))), test.assign(**dict(zip(cols, te.T))))
 
@@ -254,8 +327,19 @@ def rewards(df, clip=0.01):
 # with tau = Gamma[:, pit] - Gamma[:, stay], so each leaf just checks sign(sum tau).
 
 class PolicyTree:
-    def __init__(self, depth=2, n_bins=16, min_leaf_frac=0.02, features=TREE_FEATURES):
+    """Exact optimal policy tree on binned splits.
+
+    min_leaf_frac: every leaf holds at least this fraction of rows.
+    min_leaf_pits: every leaf holds at least this many rows with an actual stop (T = 1).
+        With DR rewards, a leaf with few real stops has a pit value driven by a handful
+        of residuals weighted by 1/p (up to 100), so the tree can "find" boxes that
+        just contain lucky stops. Requires `pits` in fit().
+    """
+
+    def __init__(self, depth=2, n_bins=16, min_leaf_frac=0.02, features=TREE_FEATURES,
+                 min_leaf_pits=0):
         self.depth, self.n_bins, self.min_leaf_frac = depth, n_bins, min_leaf_frac
+        self.min_leaf_pits = min_leaf_pits
         self.features = list(features)
 
     # -- binning --
@@ -276,32 +360,40 @@ class PolicyTree:
                                 for j, t in enumerate(self.thresholds)])
 
     # -- search --
-    def _leaf(self, tau_sum, n):
-        return {"action": int(tau_sum > 0), "n": int(n), "tau_sum": float(tau_sum)}
+    def _leaf(self, idx):
+        tau_sum = self.tau[idx].sum()
+        return {"action": int(tau_sum > 0), "n": int(len(idx)), "tau_sum": float(tau_sum),
+                "pits": int(self.pits[idx].sum())}
+
+    def _splittable(self, idx):
+        return (len(idx) >= 2 * self.min_leaf
+                and self.pits[idx].sum() >= 2 * self.min_leaf_pits)
 
     def _hist(self, idx):
-        """Per (feature, bin): sum of tau and count, shape (p, q)."""
+        """Per (feature, bin): sum of tau, row count and stop count, each shape (p, q)."""
         p, q = self.B.shape[1], self.q
         keys = (self.B[idx] + np.arange(p) * q).ravel()
         s = np.bincount(keys, weights=np.repeat(self.tau[idx], p), minlength=p * q)
         c = np.bincount(keys, minlength=p * q)
-        return s.reshape(p, q), c.reshape(p, q)
+        k = np.bincount(keys, weights=np.repeat(self.pits[idx], p), minlength=p * q)
+        return s.reshape(p, q), c.reshape(p, q), k.reshape(p, q)
 
-    def _best1_from_hist(self, s, c):
+    def _best1_from_hist(self, s, c, k):
         """Best depth-1 value per (..., feature): returns value, bin."""
-        Ls, Lc = np.cumsum(s, -1)[..., :-1], np.cumsum(c, -1)[..., :-1]
-        Ts, Tc = s.sum(-1, keepdims=True), c.sum(-1, keepdims=True)
+        Ls, Lc, Lk = (np.cumsum(a, -1)[..., :-1] for a in (s, c, k))
+        Ts, Tc, Tk = (a.sum(-1, keepdims=True) for a in (s, c, k))
         val = np.maximum(Ls, 0) + np.maximum(Ts - Ls, 0)
-        ok = (Lc >= self.min_leaf) & (Tc - Lc >= self.min_leaf)
+        ok = ((Lc >= self.min_leaf) & (Tc - Lc >= self.min_leaf)
+              & (Lk >= self.min_leaf_pits) & (Tk - Lk >= self.min_leaf_pits))
         val = np.where(ok, val, -np.inf)
         return val.max(-1), val.argmax(-1)
 
     def _depth1(self, idx):
         total = self.tau[idx].sum()
         best = (max(total, 0), None)
-        if len(idx) >= 2 * self.min_leaf:
-            s, c = self._hist(idx)
-            v, b = self._best1_from_hist(s, c)
+        if self._splittable(idx):
+            s, c, k = self._hist(idx)
+            v, b = self._best1_from_hist(s, c, k)
             j = int(np.argmax(v))
             if v[j] > best[0] + 1e-9:
                 best = (v[j], (j, int(b[j])))
@@ -311,22 +403,27 @@ class PolicyTree:
         """Exact best depth<=2 tree on idx: O(n p^2) via joint histograms."""
         v1, split1 = self._depth1(idx)
         best = (v1, ("d1", split1))
-        if len(idx) < 2 * self.min_leaf:
+        if not self._splittable(idx):
             return best
         p, q = self.B.shape[1], self.q
-        Bi, ti = self.B[idx], self.tau[idx]
-        tot_s, tot_c = self._hist(idx)
+        Bi, ti, ki = self.B[idx], self.tau[idx], self.pits[idx]
+        tot_s, tot_c, tot_k = self._hist(idx)
         for j in range(p):
             keys = (Bi[:, [j]] * (p * q) + np.arange(p) * q + Bi).ravel()
             s = np.bincount(keys, weights=np.repeat(ti, p), minlength=q * p * q).reshape(q, p, q)
             c = np.bincount(keys, minlength=q * p * q).reshape(q, p, q)
-            Ls, Lc = np.cumsum(s, 0)[:-1], np.cumsum(c, 0)[:-1]       # left child per root bin
-            Rs, Rc = tot_s[None] - Ls, tot_c[None] - Lc
+            k = np.bincount(keys, weights=np.repeat(ki, p), minlength=q * p * q).reshape(q, p, q)
+            # left child per root bin
+            Ls, Lc, Lk = np.cumsum(s, 0)[:-1], np.cumsum(c, 0)[:-1], np.cumsum(k, 0)[:-1]
+            Rs, Rc, Rk = tot_s[None] - Ls, tot_c[None] - Lc, tot_k[None] - Lk
             nL, nR = Lc[:, 0].sum(-1), Rc[:, 0].sum(-1)
+            kL, kR = Lk[:, 0].sum(-1), Rk[:, 0].sum(-1)
             sumL, sumR = Ls[:, 0].sum(-1), Rs[:, 0].sum(-1)
-            bestL = np.maximum(self._best1_from_hist(Ls, Lc)[0].max(-1), np.maximum(sumL, 0))
-            bestR = np.maximum(self._best1_from_hist(Rs, Rc)[0].max(-1), np.maximum(sumR, 0))
-            val = np.where((nL >= self.min_leaf) & (nR >= self.min_leaf), bestL + bestR, -np.inf)
+            bestL = np.maximum(self._best1_from_hist(Ls, Lc, Lk)[0].max(-1), np.maximum(sumL, 0))
+            bestR = np.maximum(self._best1_from_hist(Rs, Rc, Rk)[0].max(-1), np.maximum(sumR, 0))
+            ok = ((nL >= self.min_leaf) & (nR >= self.min_leaf)
+                  & (kL >= self.min_leaf_pits) & (kR >= self.min_leaf_pits))
+            val = np.where(ok, bestL + bestR, -np.inf)
             b = int(np.argmax(val))
             if val[b] > best[0] + 1e-9:
                 best = (val[b], ("d2", (j, b)))
@@ -339,7 +436,7 @@ class PolicyTree:
     def _build(self, idx, kind_split):
         kind, sp = kind_split
         if sp is None:
-            return self._leaf(self.tau[idx].sum(), len(idx))
+            return self._leaf(idx)
         j, b = sp
         left, right = self._split(idx, j, b)
         if kind == "d1":    # children are leaves
@@ -351,9 +448,19 @@ class PolicyTree:
         return {"feature": self.features[j], "threshold": float(self.thresholds[j][b]),
                 "n": int(len(idx)), "left": self._build(left, lk), "right": self._build(right, rk)}
 
-    def fit(self, X, tau):
+    def _ok_split(self, left, right):
+        return (len(left) >= self.min_leaf and len(right) >= self.min_leaf
+                and self.pits[left].sum() >= self.min_leaf_pits
+                and self.pits[right].sum() >= self.min_leaf_pits)
+
+    def fit(self, X, tau, pits=None):
         X = np.asarray(X, dtype=float)
         self.tau = np.asarray(tau, dtype=float)
+        if pits is None:
+            if self.min_leaf_pits > 0:
+                raise ValueError("min_leaf_pits needs the actual actions: fit(X, tau, pits=T)")
+            pits = np.zeros(len(X))
+        self.pits = np.asarray(pits, dtype=float)
         self.min_leaf = max(1, int(self.min_leaf_frac * len(X)))
         self._fit_bins(X)
         self.B = self._bin(X)
@@ -369,13 +476,13 @@ class PolicyTree:
             for j in range(p):
                 for b in range(len(self.thresholds[j])):
                     left, right = self._split(idx, j, b)
-                    if len(left) < self.min_leaf or len(right) < self.min_leaf:
+                    if not self._ok_split(left, right):
                         continue
                     v = self._depth2(left)[0] + self._depth2(right)[0]
                     if v > best[0] + 1e-9:
                         best = (v, ("d3", (j, b)))
         self.tree_ = self._build(idx, best[1])
-        del self.B, self.tau
+        del self.B, self.tau, self.pits
         return self
 
     def predict(self, X):

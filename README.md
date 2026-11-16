@@ -123,6 +123,26 @@ Leaves must hold ≥ 2% of rows. `test_depth2_search_is_exact` and
 `test_depth3_search_is_exact` check the solver against brute-force enumeration. This replaces a MIO solver (e.g. Interpretable AI), which we
 don't have; for two actions and binned splits it gives the same optimum.
 
+## P0 update: executable evaluation (Nov. 14)
+
+```bash
+python run_p0.py            # ~30 min -> results_p0/ (--quick: ~2 min smoke test)
+```
+
+- `stopping.py`: scores any lap-level rule as an executable plan (one stop per stint,
+  at the first lap it says PIT, grace window of 2 laps), off-policy by
+  clone-censor-weight on a rest-of-race outcome (`build_rows(K="race")`, no stop debt).
+  Stratified by stint (1 / 2 / 3+), weights truncated at 20, gradient-boosted
+  propensity (`prepare(..., propensity="gbm")`), which is calibrated over whole stints.
+- `PolicyTree(min_leaf_pits=...)`: minimum number of actual stops per leaf (still exact).
+- `run_p0.py`: CV by the executable value over outcome x clip x stops-per-leaf x depth,
+  direct rule search, sensitivity (grace, weight cap) and 100-resample stability.
+- Result: a stable dose-response (stopping before ~16 laps of tyre age costs time in
+  both 2023-24 and 2025), but no learned rule is stable across bootstrap refits. Details
+  and the revised to-do list are in `report/report.pdf`, section "P0 update".
+- `first_results/` keeps the v1 outputs and report; `run_experiment.py` still reproduces
+  them exactly.
+
 ## Changes from the proposal
 
 Each change came from a sanity check that failed on a known racing fact, before the

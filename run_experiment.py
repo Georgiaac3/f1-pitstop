@@ -27,7 +27,7 @@ CLIP = 0.01  # propensities are clipped to [CLIP, 1 - CLIP] inside the DR weight
 
 
 def prepare(laps, K=10, stop_debt=True, trim=TRIM, clip=CLIP, drop_sc=False,
-            debt_pitlane=False, reference="local"):
+            debt_pitlane=False, reference="local", propensity="logit"):
     """Rows, cross-fitted nuisances and rewards for train and test, trimmed to common support."""
     train_laps = laps[laps["Year"].isin(TRAIN_YEARS)]
     # Circuit constants are nuisances too: estimate them on training races only.
@@ -43,7 +43,7 @@ def prepare(laps, K=10, stop_debt=True, trim=TRIM, clip=CLIP, drop_sc=False,
         rows = rows[(rows["SafetyCar"] == 0) & (rows["VSC"] == 0)]
     train = rows[rows["Year"].isin(TRAIN_YEARS)].reset_index(drop=True)
     test = rows[rows["Year"] == TEST_YEAR].reset_index(drop=True)
-    train, test = nuisance_predictions(train, test)
+    train, test = nuisance_predictions(train, test, propensity=propensity)
     for df in (train, test):  # rewards are per row, so trimming afterwards is fine
         dm, dr = rewards(df, clip=clip)
         df[["dm0", "dm1"]], df[["dr0", "dr1"]] = dm, dr

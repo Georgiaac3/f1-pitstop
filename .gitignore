@@ -1,7 +1,9 @@
 last_year_results/
 cache/
 __pycache__/
-results/
+results*
 .venv/
 .pytest_cache/
 *.tmp
+report/
+GUIDE.md
