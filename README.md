@@ -71,6 +71,7 @@ pip install -r requirements.txt
 python run_experiment.py            # first study (~2 min)
 python run_p0.py --quick            # P0 study, fast version (~2 min)
 python run_p1.py --quick            # P1 study, fast version (~5 min)
+python run_p2.py                    # P2 study (~1 min; the IAI step needs the IAI Julia image)
 streamlit run results_dashboard.py  # interactive results
 ```
 
@@ -85,6 +86,7 @@ The race data is already included (`data/laps.pkl`), so nothing needs downloadin
 | `run_experiment.py` | First study |
 | `run_p0.py`, `stopping.py` | P0 study: executable (one stop per stint) evaluation |
 | `run_p1.py` | P1 study: no circuit proxies in the tree, better nuisance models, nested CV, second holdout (2023 → 2024) |
+| `run_p2.py`, `compound.py`, `iai_compare.jl` | P2 study: compound choice at the stop, check against Interpretable AI, race replays |
 | `results_dashboard.py`, `dashboard.py` | Interactive views of the results and the raw data |
 | `report/` | The technical report (PDF) |
 | `first_results/` | Saved copy of the first study's results |

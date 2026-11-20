@@ -173,3 +173,43 @@ st.altair_chart((line + tree_marks + team_marks).properties(height=300), width="
 st.caption("Green ticks (top): laps where the tree says pit. Orange triangles: laps the "
            "team actually pitted. Line: per-row DR score (noisy by design; only averages "
            "are meaningful). Rows exist only where a stop was a real option.")
+
+# ---- P2 case studies: rule vs team, whole race (reads results_p2/) -----------
+P2 = Path(__file__).parent / "results_p2"
+if (P2 / "replay_laps.csv").exists():
+    st.subheader("Race replay: stopping rules vs teams (P2, 2025)")
+    rl = pd.read_csv(P2 / "replay_laps.csv")
+    sthr = pd.read_csv(P2 / "replay_stints_threshold.csv")
+    stree = pd.read_csv(P2 / "replay_stints_tree.csv")
+    infl = pd.read_csv(P2 / "race_influence.csv").set_index("Event")["influence"]
+    ev2 = st.selectbox("Race (2025)", list(infl.sort_values().index),
+                       format_func=lambda e: f"{e}  (rule contribution {infl[e]:+.2f} s)")
+    lr = rl[rl["Event"] == ev2]
+    order = (lr.sort_values("LapNumber").groupby("Driver").tail(1)
+             .sort_values(["LapNumber", "Position"], ascending=[False, True])["Driver"].tolist())
+    seg = (lr.sort_values(["Driver", "LapNumber"])
+           .assign(Seg=lambda d: ((d["Compound"] != d.groupby("Driver")["Compound"].shift())
+                                  | (d["Stint"] != d.groupby("Driver")["Stint"].shift())).cumsum())
+           .groupby(["Driver", "Seg", "Compound"], as_index=False)
+           .agg(start=("LapNumber", "min"), end=("LapNumber", "max")))
+    seg["start"] -= 1
+    comp_colors = alt.Scale(domain=["SOFT", "MEDIUM", "HARD", "INTERMEDIATE", "WET"],
+                            range=["#e8434f", "#f2c230", "#cfcfcf", "#3fae5a", "#2a78d6"])
+    y = alt.Y("Driver:N", sort=order, title=None)
+    bars = alt.Chart(seg).mark_bar(height=12).encode(
+        x=alt.X("start:Q", title="Lap"), x2="end:Q", y=y,
+        color=alt.Color("Compound:N", scale=comp_colors), tooltip=["Driver", "Compound", "start", "end"])
+    stops = alt.Chart(lr[lr["Pit"] == 1]).mark_tick(color="black", thickness=2, size=14).encode(
+        x="LapNumber:Q", y=y, tooltip=["Driver", "LapNumber", "TyreLife"])
+    fire_a = alt.Chart(sthr[(sthr["Event"] == ev2)].dropna(subset=["FireLap"])).mark_point(
+        shape="triangle-down", filled=True, size=60, color="#1f3b99").encode(
+        x="FireLap:Q", y=y, tooltip=["Driver", "FireLap", "Follows", alt.Tooltip("Weight:Q", format=".2f")])
+    fire_b = alt.Chart(stree[(stree["Event"] == ev2)].dropna(subset=["FireLap"])).mark_point(
+        shape="diamond", filled=True, size=50, color="#a51d1d").encode(
+        x="FireLap:Q", y=y, tooltip=["Driver", "FireLap", "Follows"])
+    st.altair_chart((bars + stops + fire_a + fire_b).properties(height=24 * len(order) + 40),
+                    width="stretch")
+    st.caption(f"Bars: tyre compound per stint. Black ticks: the team's stops. Blue triangles: "
+               f"first lap the threshold rule ({sthr['Rule'].iloc[0]}) says PIT in each stint. "
+               f"Red diamonds: first PIT of the P1 tree. A stint 'follows' a rule if the team's "
+               f"stop fell within 2 laps of that marker; only followers inform the rule's value.")

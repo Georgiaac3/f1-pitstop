@@ -308,3 +308,51 @@ def test_cross_fitted_predictions_never_see_their_own_race():
     cols = ["f0", "f1", "p1"]
     np.testing.assert_allclose(a.loc[m, cols], b.loc[m, cols])
     assert not np.allclose(a.loc[~m, cols], b.loc[~m, cols])
+
+
+# --------------------------------------------------------------------------
+# P2: multi-action tree (compound choice)
+# --------------------------------------------------------------------------
+
+def _brute_multi(X, G, thresholds, min_leaf, depth):
+    def best(idx, d):
+        v = G[idx].sum(0).max()
+        if d == 0:
+            return v
+        for j, thr in enumerate(thresholds):
+            for t in thr:
+                m = X[idx, j] <= t
+                l, r = idx[m], idx[~m]
+                if len(l) >= min_leaf and len(r) >= min_leaf:
+                    v = max(v, best(l, d - 1) + best(r, d - 1))
+        return v
+    return best(np.arange(len(X)), depth)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("depth", [1, 2])
+def test_multi_action_tree_is_exact(seed, depth):
+    from compound import MultiActionTree
+    rng = np.random.default_rng(seed)
+    X = rng.integers(0, 5, size=(150, 3)).astype(float)
+    G = rng.normal(size=(150, 3))
+    G[X[:, 0] > 2, 2] += 1.5
+    G[(X[:, 0] <= 2) & (X[:, 1] > 1), 0] += 1.5
+    tree = MultiActionTree(depth=depth, min_leaf_frac=0.05, features=["a", "b", "c"]).fit(X, G)
+    got = G[np.arange(len(X)), tree.predict(X)].sum()
+    want = _brute_multi(X, G, [np.unique(X[:, j])[:-1] for j in range(3)], int(0.05 * 150), depth)
+    assert got == pytest.approx(want)
+    assert tree.objective_ == pytest.approx(want)
+
+
+def test_compound_dr_reward_is_unbiased_with_true_propensity():
+    from compound import dr_rewards
+    rng = np.random.default_rng(0)
+    n = 200000
+    e = rng.dirichlet([2, 2, 2], size=n)
+    A = (rng.random(n)[:, None] > np.cumsum(e, 1)).sum(1)
+    truth = np.array([1.0, 2.0, -1.0])
+    y = truth[A] + rng.normal(0, 1, n)
+    mu = np.zeros((n, 3))              # deliberately wrong outcome model
+    G = dr_rewards(pd.DataFrame({"A": A, "y": y}), mu, e, clip=1e-9)
+    np.testing.assert_allclose(G.mean(0), truth, atol=0.05)

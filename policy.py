@@ -165,6 +165,8 @@ def build_rows(laps, K=10, min_tyre_age=5, stop_debt=True, pit_loss=None, stop_c
     used = laps[[f"Used{c}" for c in DRY]].sum(axis=1)
     laps["TwoCompoundsDone"] = (used >= 2).astype(int)
     laps["DryStint"] = dry_stint(laps)
+    # Compound fitted at a stop at the end of lap L = the compound of lap L+1 (P2).
+    laps["NewCompound"] = g["Compound"].shift(-1)
     laps["DoneByWindowEnd"] = 1.0 if race else g["TwoCompoundsDone"].shift(-(K - 1))
 
     if pit_loss is None:
