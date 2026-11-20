@@ -232,3 +232,79 @@ def test_executable_estimator_recovers_simulated_value():
         _, y_rule = _sim_stints(20000, np.random.default_rng(1), rule_age=rule_age)
         truth = y_rule.mean() - y.mean()
         assert est == pytest.approx(truth, abs=0.15), (rule_age, est, truth)
+
+
+# --------------------------------------------------------------------------
+# P1: dry-stint index, outcome learners, honest cross-fitting
+# --------------------------------------------------------------------------
+
+def test_dry_stint_ignores_wet_stints():
+    from policy import dry_stint
+    comp = ["INTERMEDIATE"] * 3 + ["MEDIUM"] * 4 + ["HARD"] * 3
+    stint = [1] * 3 + [2] * 4 + [3] * 3
+    wet = pd.DataFrame({"Event": "e", "Driver": "A", "LapNumber": range(1, 11),
+                        "Stint": stint, "Compound": comp})
+    dry = pd.DataFrame({"Event": "e", "Driver": "B", "LapNumber": range(1, 11),
+                        "Stint": [1] * 5 + [2] * 5, "Compound": ["SOFT"] * 5 + ["HARD"] * 5})
+    laps = pd.concat([wet, dry], ignore_index=True).sample(frac=1, random_state=0)
+    out = dry_stint(laps)
+    got = laps.assign(D=out).sort_values(["Driver", "LapNumber"])["D"].tolist()
+    assert got == [0, 0, 0, 1, 1, 1, 1, 2, 2, 2] + [1] * 5 + [2] * 5
+
+
+def _nuisance_toy(seed=0, n_races=30, per_race=300):
+    from policy import NUISANCE_FEATURES_P1
+    rng = np.random.default_rng(seed)
+    n = n_races * per_race
+    df = pd.DataFrame(rng.normal(size=(n, len(NUISANCE_FEATURES_P1))), columns=NUISANCE_FEATURES_P1)
+    df["TyreLife"] = rng.integers(5, 40, n).astype(float)
+    df["LapsRemaining"] = rng.integers(5, 60, n).astype(float)
+    df["TwoCompoundsDone"] = rng.integers(0, 2, n).astype(float)
+    df["Event"] = np.repeat([f"r{i}" for i in range(n_races)], per_race)
+    df["Team"] = rng.choice(list("ABCDE"), n)
+    df["Circuit"] = df["Event"]
+    df["Driver"] = rng.choice(list("abcdefghij"), n)
+    p = 1 / (1 + np.exp(-(-4 + 0.08 * df["TyreLife"])))
+    df["T"] = (rng.random(n) < p).astype(int)
+    # Pit effect: -20 s, a bit less with worn tyres. Baseline depends on tyre age.
+    effect = -20 + 0.2 * (df["TyreLife"] - 20)
+    df["y"] = -1.0 * df["TyreLife"] + df["T"] * effect + rng.normal(0, 2, n)
+    return df, effect.to_numpy()
+
+
+@pytest.mark.parametrize("learner", ["t", "s", "offset"])
+def test_outcome_learners_recover_the_pit_effect(learner):
+    from policy import NuisanceSpec, NUISANCE_FEATURES_P1, nuisance_predictions
+    df, effect = _nuisance_toy()
+    spec = NuisanceSpec(features=tuple(NUISANCE_FEATURES_P1),
+                        categorical=("Team", "Circuit", "Driver"), outcome=learner,
+                        propensity="gbm", prop_categorical=("Driver",))
+    tr, te = df[df["Event"] < "r2"], df[df["Event"] >= "r2"]
+    tr, te = nuisance_predictions(tr.reset_index(drop=True), te.reset_index(drop=True), spec=spec)
+    est = (te["f1"] - te["f0"]).to_numpy()
+    assert est.mean() == pytest.approx(-20 + 0.2 * (te["TyreLife"].mean() - 20), abs=1.5)
+    pit = te["T"] == 1
+    assert r2_score_(te.loc[pit, "y"], te.loc[pit, "f1"]) > 0.7  # oracle: ~0.94
+
+
+def r2_score_(y, f):
+    y, f = np.asarray(y), np.asarray(f)
+    return 1 - ((y - f) ** 2).sum() / ((y - y.mean()) ** 2).sum()
+
+
+def test_cross_fitted_predictions_never_see_their_own_race():
+    """The property nested CV relies on: a race's cross-fitted nuisances do not change
+    when that race's outcomes or actions change."""
+    from policy import NuisanceSpec, NUISANCE_FEATURES_P1, nuisance_predictions
+    df, _ = _nuisance_toy(n_races=10, per_race=200)
+    spec = NuisanceSpec(features=tuple(NUISANCE_FEATURES_P1), outcome="offset",
+                        propensity="gbm")
+    a, _ = nuisance_predictions(df, df.iloc[:5], spec=spec)
+    df2 = df.copy()
+    m = df2["Event"] == "r3"
+    df2.loc[m, "y"] += 100.0
+    df2.loc[m, "T"] = 1 - df2.loc[m, "T"]
+    b, _ = nuisance_predictions(df2, df2.iloc[:5], spec=spec)
+    cols = ["f0", "f1", "p1"]
+    np.testing.assert_allclose(a.loc[m, cols], b.loc[m, cols])
+    assert not np.allclose(a.loc[~m, cols], b.loc[~m, cols])

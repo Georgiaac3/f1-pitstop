@@ -27,9 +27,26 @@ CLIP = 0.01  # propensities are clipped to [CLIP, 1 - CLIP] inside the DR weight
 
 
 def prepare(laps, K=10, stop_debt=True, trim=TRIM, clip=CLIP, drop_sc=False,
-            debt_pitlane=False, reference="local", propensity="logit"):
-    """Rows, cross-fitted nuisances and rewards for train and test, trimmed to common support."""
-    train_laps = laps[laps["Year"].isin(TRAIN_YEARS)]
+            debt_pitlane=False, reference="local", propensity="logit", spec=None,
+            train_years=TRAIN_YEARS, test_year=TEST_YEAR):
+    """Rows, cross-fitted nuisances and rewards for train and test, trimmed to common support.
+    spec: a policy.NuisanceSpec (overrides `propensity`)."""
+    train, test, info, pit_loss = build_split(laps, K, stop_debt, drop_sc, debt_pitlane,
+                                              reference, train_years, test_year)
+    train, test = nuisance_predictions(train, test, propensity=propensity, spec=spec)
+    for df in (train, test):  # rewards are per row, so trimming afterwards is fine
+        dm, dr = rewards(df, clip=clip)
+        df[["dm0", "dm1"]], df[["dr0", "dr1"]] = dm, dr
+    train, test, dropped = trim_support(train, test, trim)
+    info.update(dropped)
+    return train, test, info, pit_loss
+
+
+def build_split(laps, K=10, stop_debt=True, drop_sc=False, debt_pitlane=False,
+                reference="local", train_years=TRAIN_YEARS, test_year=TEST_YEAR):
+    """Decision rows for train and test seasons (no nuisances yet)."""
+    laps = laps[laps["Year"].isin(list(train_years) + [test_year])]
+    train_laps = laps[laps["Year"].isin(train_years)]
     # Circuit constants are nuisances too: estimate them on training races only.
     pit_loss = estimate_pit_loss(train_laps)
     stop_cost = estimate_stop_cost(build_rows(train_laps, K=K, stop_debt=False,
@@ -41,16 +58,10 @@ def prepare(laps, K=10, stop_debt=True, trim=TRIM, clip=CLIP, drop_sc=False,
                       reference=reference)
     if drop_sc:
         rows = rows[(rows["SafetyCar"] == 0) & (rows["VSC"] == 0)]
-    train = rows[rows["Year"].isin(TRAIN_YEARS)].reset_index(drop=True)
-    test = rows[rows["Year"] == TEST_YEAR].reset_index(drop=True)
-    train, test = nuisance_predictions(train, test, propensity=propensity)
-    for df in (train, test):  # rewards are per row, so trimming afterwards is fine
-        dm, dr = rewards(df, clip=clip)
-        df[["dm0", "dm1"]], df[["dr0", "dr1"]] = dm, dr
+    train = rows[rows["Year"].isin(train_years)].reset_index(drop=True)
+    test = rows[rows["Year"] == test_year].reset_index(drop=True)
     info = {"rows_train": len(train), "rows_test": len(test),
             "stop_cost_overall": stop_cost[1]}
-    train, test, dropped = trim_support(train, test, trim)
-    info.update(dropped)
     return train, test, info, pit_loss
 
 

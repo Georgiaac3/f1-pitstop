@@ -14,6 +14,7 @@ nuisances fit on training races only, bootstrap CIs over races.
 """
 
 import warnings
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,15 @@ TREE_FEATURES = ["TyreLife", "RaceFraction", "LapsRemaining", "CompoundCode",
                  "SafetyCar", "VSC", "TrackTemp", "PitLoss"]
 # Nuisance models also get team and circuit effects (proposal: confounding).
 CATEGORICAL = ["Team", "Circuit"]
+
+# P1 tree features: no circuit stand-ins (PitLoss, TrackTemp mostly identify the track,
+# so trees split on "which circuit" rather than "which situation"; they stay in the
+# nuisances), and DryStint (index among dry stints) instead of Stint, so a wet start
+# does not shift every later stint.
+TREE_FEATURES_P1 = ["TyreLife", "RaceFraction", "LapsRemaining", "CompoundCode",
+                    "TwoCompoundsDone", "DryStint", "Position", "GapAhead", "GapBehind",
+                    "SafetyCar", "VSC"]
+NUISANCE_FEATURES_P1 = TREE_FEATURES_P1 + ["TrackTemp", "PitLoss"]
 
 
 # --------------------------------------------------------------------------
@@ -66,6 +76,19 @@ def estimate_stop_cost(laps):
                  & laps["Compound"].isin(DRY)]
     return ((-stops.groupby("Circuit")["Gain"].median()).to_dict(),
             float(-stops["Gain"].median()))
+
+
+def dry_stint(laps):
+    """1 for a driver's first stint on slicks, 2 for the next, ... (0 before any).
+    Stint counts wet stints too, so after a start on intermediates every dry lap would
+    be in Stint >= 2. `laps` must hold every lap of the race, sorted or not."""
+    sg = laps.groupby(["Event", "Driver", "Stint"])
+    new_dry = ((laps["LapNumber"] == sg["LapNumber"].transform("min"))
+               & sg["Compound"].transform("first").isin(DRY))
+    order = laps.sort_values(["Event", "Driver", "LapNumber"]).index
+    out = new_dry.loc[order].astype(int).groupby(
+        [laps.loc[order, "Event"], laps.loc[order, "Driver"]]).cumsum()
+    return out.reindex(laps.index)
 
 
 def local_median(df, value="Elapsed", window=3):
@@ -141,6 +164,7 @@ def build_rows(laps, K=10, min_tyre_age=5, stop_debt=True, pit_loss=None, stop_c
         laps[f"Used{c}"] = (dry == c).astype(int).groupby([laps["Event"], laps["Driver"]]).cummax()
     used = laps[[f"Used{c}" for c in DRY]].sum(axis=1)
     laps["TwoCompoundsDone"] = (used >= 2).astype(int)
+    laps["DryStint"] = dry_stint(laps)
     laps["DoneByWindowEnd"] = 1.0 if race else g["TwoCompoundsDone"].shift(-(K - 1))
 
     if pit_loss is None:
@@ -208,36 +232,63 @@ def build_rows(laps, K=10, min_tyre_age=5, stop_debt=True, pit_loss=None, stop_c
 # 3. Nuisance models
 # --------------------------------------------------------------------------
 
-def _design(df):
-    X = df[TREE_FEATURES].copy()
-    for c in CATEGORICAL:
+@dataclass(frozen=True)
+class NuisanceSpec:
+    """Which nuisance models to fit. The defaults reproduce v1; P0 is propensity="gbm".
+
+    features / categorical: inputs of the outcome models (and of the logistic propensity).
+    outcome: "t"      T-learner, one boosted model per action (v1, P0);
+             "s"      S-learner, one boosted model with T as a feature;
+             "offset" f1 = f0 + g, with g a shallow boosted model of the pit rows'
+                      residual y - f0: the pit model borrows f0's structure and only
+                      learns the (smooth) cost of stopping from the ~1k stops.
+    propensity: "logit" (v1) or "gbm" (P0).
+    prop_categorical: categorical inputs of the gbm propensity (P0: none).
+    """
+    features: tuple = tuple(TREE_FEATURES)
+    categorical: tuple = tuple(CATEGORICAL)
+    outcome: str = "t"
+    propensity: str = "logit"
+    prop_categorical: tuple = ()
+
+
+def _design(df, spec=None):
+    spec = spec or NuisanceSpec()
+    X = df[list(spec.features)].copy()
+    for c in spec.categorical:
         X[c] = df[c].astype(str)
     return X
 
 
-def _outcome_model():
+def _hgb(n_num, n_cat, **kw):
+    params = dict(max_depth=4, learning_rate=0.05, max_iter=300, min_samples_leaf=40,
+                  l2_regularization=1.0, random_state=0)
+    params.update(kw)
     return HistGradientBoostingRegressor(
-        max_depth=4, learning_rate=0.05, max_iter=300, min_samples_leaf=40,
-        l2_regularization=1.0, categorical_features=[len(TREE_FEATURES) + i
-                                                     for i in range(len(CATEGORICAL))],
-        random_state=0)
+        categorical_features=[n_num + i for i in range(n_cat)] or None, **params)
+
+
+def _outcome_model(spec=None):
+    spec = spec or NuisanceSpec()
+    return _hgb(len(spec.features), len(spec.categorical))
 
 
 def _encode_for_hgb(X, cats):
     X = X.copy()
-    for c in CATEGORICAL:
+    for c in cats:
         X[c] = pd.Categorical(X[c], categories=cats[c]).codes.astype(float)
         X.loc[X[c] < 0, c] = np.nan
     return X
 
 
-def _propensity_model():
+def _propensity_model(spec=None):
+    spec = spec or NuisanceSpec()
     num_smooth = ["TyreLife", "RaceFraction", "LapsRemaining"]
-    num_lin = [f for f in TREE_FEATURES if f not in num_smooth]
+    num_lin = [f for f in spec.features if f not in num_smooth]
     pre = ColumnTransformer([
         ("spline", SplineTransformer(n_knots=6, degree=3), num_smooth),
         ("lin", StandardScaler(), num_lin),
-        ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=50), CATEGORICAL),
+        ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=50), list(spec.categorical)),
     ])
     return make_pipeline(pre, LogisticRegression(C=1.0, max_iter=3000))
 
@@ -252,54 +303,82 @@ def _propensity_model():
 PROP_GBM_FEATURES = TREE_FEATURES + ["StintShare", "LapsToGoIfOwed"]
 
 
-def _gbm_design(df):
-    X = df[TREE_FEATURES].copy()
+def _gbm_design(df, spec=None, cats=None):
+    spec = spec or NuisanceSpec(propensity="gbm")
+    X = df[list(spec.features)].copy()
     X["StintShare"] = df["TyreLife"] / (df["TyreLife"] + df["LapsRemaining"])
     X["LapsToGoIfOwed"] = df["LapsRemaining"] * (1 - df["TwoCompoundsDone"])
+    for c in spec.prop_categorical:
+        X[c] = pd.Categorical(df[c].astype(str), categories=cats[c]).codes.astype(float)
+        X.loc[X[c] < 0, c] = np.nan
     return X
 
 
 class _GBMPropensity:
+    def __init__(self, spec=None):
+        self.spec = spec or NuisanceSpec(propensity="gbm")
+
     def fit(self, df, T):
         from sklearn.ensemble import HistGradientBoostingClassifier
+        pc = list(self.spec.prop_categorical)
+        self.cats = {c: sorted(df[c].astype(str).unique()) for c in pc}
+        X = _gbm_design(df, self.spec, self.cats)
         self.m = HistGradientBoostingClassifier(
             max_depth=3, learning_rate=0.05, max_iter=300, min_samples_leaf=100,
-            l2_regularization=1.0, random_state=0).fit(_gbm_design(df), T)
+            l2_regularization=1.0, random_state=0,
+            categorical_features=[X.shape[1] - len(pc) + i for i in range(len(pc))] or None,
+        ).fit(X, T)
         return self
 
     def predict_proba(self, df):
-        return self.m.predict_proba(_gbm_design(df))
+        return self.m.predict_proba(_gbm_design(df, self.spec, self.cats))
 
 
-def fit_nuisances(train, propensity="logit"):
+def fit_nuisances(train, propensity="logit", spec=None):
     """Fit f_0, f_1 and the pit propensity on `train`; return a predict function.
-    propensity: "logit" (v1: splines + team/circuit effects) or "gbm" (P0)."""
-    X = _design(train)
-    cats = {c: sorted(X[c].unique()) for c in CATEGORICAL}
+    propensity: "logit" (v1: splines + team/circuit effects) or "gbm" (P0).
+    spec: a NuisanceSpec (overrides `propensity`); None means NuisanceSpec(propensity)."""
+    spec = spec or NuisanceSpec(propensity=propensity)
+    X = _design(train, spec)
+    cats = {c: sorted(X[c].unique()) for c in spec.categorical}
     Xh = _encode_for_hgb(X, cats)
-    f = {}
-    for t in (0, 1):
-        m = train["T"] == t
-        f[t] = _outcome_model().fit(Xh[m], train.loc[m, "y"])
-    if propensity == "gbm":
-        prop, prop_in = _GBMPropensity().fit(train, train["T"]), (lambda df: df)
+    T = train["T"].to_numpy()
+    y = train["y"].to_numpy()
+    n_num, n_cat = len(spec.features), len(spec.categorical)
+    if spec.outcome == "t":
+        f = {t: _outcome_model(spec).fit(Xh[T == t], y[T == t]) for t in (0, 1)}
+        out = lambda Xdh: (f[0].predict(Xdh), f[1].predict(Xdh))
+    elif spec.outcome == "s":
+        with_t = lambda Xdh, t: pd.concat([Xdh.iloc[:, :n_num].assign(T=t),
+                                           Xdh.iloc[:, n_num:]], axis=1)
+        m = _hgb(n_num + 1, n_cat).fit(with_t(Xh, T), y)
+        out = lambda Xdh: (m.predict(with_t(Xdh, 0)), m.predict(with_t(Xdh, 1)))
+    elif spec.outcome == "offset":
+        f0 = _outcome_model(spec).fit(Xh[T == 0], y[T == 0])
+        pit = T == 1  # f0 never saw these rows, so their residuals are honest
+        g = _hgb(n_num, n_cat, max_depth=2, max_iter=150, min_samples_leaf=40).fit(
+            Xh[pit], y[pit] - f0.predict(Xh[pit]))
+        out = lambda Xdh: (lambda b: (b, b + g.predict(Xdh)))(f0.predict(Xdh))
     else:
-        prop, prop_in = _propensity_model().fit(X, train["T"]), _design
+        raise ValueError(spec.outcome)
+    if spec.propensity == "gbm":
+        prop, prop_in = _GBMPropensity(spec).fit(train, train["T"]), (lambda df: df)
+    else:
+        prop, prop_in = _propensity_model(spec).fit(X, train["T"]), (lambda df: _design(df, spec))
 
     def predict(df):
-        Xd = _design(df)
-        Xdh = _encode_for_hgb(Xd, cats)
-        return f[0].predict(Xdh), f[1].predict(Xdh), prop.predict_proba(prop_in(df))[:, 1]
+        f0, f1 = out(_encode_for_hgb(_design(df, spec), cats))
+        return f0, f1, prop.predict_proba(prop_in(df))[:, 1]
     return predict
 
 
-def nuisance_predictions(train, test, n_folds=5, propensity="logit"):
+def nuisance_predictions(train, test, n_folds=5, propensity="logit", spec=None):
     """Cross-fitted (by race) predictions on train; train-only fit for test."""
     tr = np.zeros((len(train), 3))
     for fit_idx, pred_idx in GroupKFold(n_splits=n_folds).split(train, groups=train["Event"]):
-        predict = fit_nuisances(train.iloc[fit_idx], propensity)
+        predict = fit_nuisances(train.iloc[fit_idx], propensity, spec)
         tr[pred_idx] = np.column_stack(predict(train.iloc[pred_idx]))
-    te = np.column_stack(fit_nuisances(train, propensity)(test))
+    te = np.column_stack(fit_nuisances(train, propensity, spec)(test))
     cols = ["f0", "f1", "p1"]
     return (train.assign(**dict(zip(cols, tr.T))), test.assign(**dict(zip(cols, te.T))))
 

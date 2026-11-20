@@ -41,10 +41,11 @@ class Stints:
     """Decision rows (rest-of-race outcome, with p1) grouped into stints, precomputed
     so that evaluating a rule is a few vectorised operations."""
 
-    def __init__(self, rows, clip=0.01, w_max=None):
+    def __init__(self, rows, clip=0.01, w_max=None, stratum="Stint"):
         """`rows`: decision rows. Action vectors passed to follow/value/evaluate are
         aligned with `rows` as given (they are re-ordered internally).
-        w_max: truncate stint weights at this value (None: no truncation)."""
+        w_max: truncate stint weights at this value (None: no truncation).
+        stratum: column numbering the stint for the strata (P1: "DryStint")."""
         self.w_max = w_max
         rows = rows.reset_index(drop=True)
         self.order = rows.sort_values(["Event", "Driver", "Stint", "LapNumber"]).index.to_numpy()
@@ -73,7 +74,7 @@ class Stints:
         self.obs_row = np.where(self.has_obs & (self.key[idx] == key_obs), idx, -1)
         self.Y = rows["y"].to_numpy()[self.start]               # rest-of-race at stint start
         self.race = rows["Event"].to_numpy()[self.start]
-        self.stint_no = rows["Stint"].to_numpy()[self.start]
+        self.stint_no = rows[stratum].to_numpy()[self.start]
         self.tyre = rows["TyreLife"].to_numpy()
 
     def follow(self, actions, grace=2):
